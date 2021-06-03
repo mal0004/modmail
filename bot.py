@@ -1,4 +1,4 @@
-__version__ = "3.7.14-dev4"
+__version__ = "v3.10.0-dev3"
 
 
 import asyncio
@@ -6,6 +6,7 @@ import copy
 import logging
 import os
 import re
+import signal
 import sys
 import typing
 from datetime import datetime
@@ -46,7 +47,7 @@ from core.models import (
 )
 from core.thread import ThreadManager
 from core.time import human_timedelta
-from core.utils import human_join, normalize_alias, truncate
+from core.utils import normalize_alias, truncate
 
 logger = getLogger(__name__)
 
@@ -107,6 +108,15 @@ class ModmailBot(commands.Bot):
 
         if os.environ.get("pm_id"):
             return HostingMethod.PM2
+
+        if os.environ.get("INVOCATION_ID"):
+            return HostingMethod.SYSTEMD
+
+        if os.environ.get("USING_DOCKER"):
+            return HostingMethod.DOCKER
+
+        if os.environ.get("TERM"):
+            return HostingMethod.SCREEN
 
         return HostingMethod.OTHER
 
@@ -184,40 +194,106 @@ class ModmailBot(commands.Bot):
     async def get_prefix(self, message=None):
         return [self.prefix, f"<@{self.user.id}> ", f"<@!{self.user.id}> "]
 
-    def run(self, *args, **kwargs):
+    def run(self):
+        loop = self.loop
+
         try:
-            self.loop.run_until_complete(self.start(self.token))
-        except KeyboardInterrupt:
+            loop.add_signal_handler(signal.SIGINT, lambda: loop.stop())
+            loop.add_signal_handler(signal.SIGTERM, lambda: loop.stop())
+        except NotImplementedError:
             pass
-        except discord.LoginFailure:
-            logger.critical("Invalid token")
-        except discord.PrivilegedIntentsRequired:
-            intents = discord.Intents.default()
-            intents.members = True
-            # Try again with members intent
-            self._connection._intents = intents
-            logger.warning(
-                "Attempting to login with only the server members privileged intent. Some plugins might not work correctly."
-            )
+
+        async def runner():
             try:
-                self.loop.run_until_complete(self.start(self.token))
+                retry_intents = False
+                try:
+                    await self.start(self.token)
+                except discord.PrivilegedIntentsRequired:
+                    retry_intents = True
+                if retry_intents:
+                    await self.http.close()
+                    if self.ws is not None and self.ws.open:
+                        await self.ws.close(code=1000)
+                    self._ready.clear()
+                    intents = discord.Intents.default()
+                    intents.members = True
+                    # Try again with members intent
+                    self._connection._intents = intents
+                    logger.warning(
+                        "Attempting to login with only the server members privileged intent. Some plugins might not work correctly."
+                    )
+                    await self.start(self.token)
             except discord.PrivilegedIntentsRequired:
                 logger.critical(
                     "Privileged intents are not explicitly granted in the discord developers dashboard."
                 )
-        except Exception:
-            logger.critical("Fatal exception", exc_info=True)
-        finally:
-            self.loop.run_until_complete(self.logout())
-            for task in asyncio.all_tasks(self.loop):
-                task.cancel()
-            try:
-                self.loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(self.loop)))
-            except asyncio.CancelledError:
-                logger.debug("All pending tasks has been cancelled.")
+            except discord.LoginFailure:
+                logger.critical("Invalid token")
+            except Exception:
+                logger.critical("Fatal exception", exc_info=True)
             finally:
-                self.loop.run_until_complete(self.session.close())
-                logger.error(" - Shutting down bot - ")
+                if not self.is_closed():
+                    await self.close()
+                if self._session:
+                    await self._session.close()
+
+        def stop_loop_on_completion(f):
+            loop.stop()
+
+        def _cancel_tasks():
+            if sys.version_info < (3, 8):
+                task_retriever = asyncio.Task.all_tasks
+            else:
+                task_retriever = asyncio.all_tasks
+
+            tasks = {t for t in task_retriever(loop=loop) if not t.done()}
+
+            if not tasks:
+                return
+
+            logger.info("Cleaning up after %d tasks.", len(tasks))
+            for task in tasks:
+                task.cancel()
+
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            logger.info("All tasks finished cancelling.")
+
+            for task in tasks:
+                if task.cancelled():
+                    continue
+                if task.exception() is not None:
+                    loop.call_exception_handler(
+                        {
+                            "message": "Unhandled exception during Client.run shutdown.",
+                            "exception": task.exception(),
+                            "task": task,
+                        }
+                    )
+
+        future = asyncio.ensure_future(runner(), loop=loop)
+        future.add_done_callback(stop_loop_on_completion)
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Received signal to terminate bot and event loop.")
+        finally:
+            future.remove_done_callback(stop_loop_on_completion)
+            logger.info("Cleaning up tasks.")
+
+            try:
+                _cancel_tasks()
+                if sys.version_info >= (3, 6):
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                logger.info("Closing the event loop.")
+                loop.close()
+
+        if not future.cancelled():
+            try:
+                return future.result()
+            except KeyboardInterrupt:
+                # I am unsure why this gets raised here but suppress it anyway
+                return None
 
     @property
     def bot_owner_ids(self):
@@ -673,18 +749,18 @@ class ModmailBot(commands.Bot):
                         end_time = re.search(r"%([^%]+?)%", blocked_reason)
                         if end_time is not None:
                             logger.warning(
-                                r"Deprecated time message for user %s, block and unblock again to update.",
-                                author.name,
+                                r"Deprecated time message for role %s, block and unblock again to update.",
+                                r.name,
                             )
 
                     if end_time is not None:
                         after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
                         if after <= 0:
                             # No longer blocked
-                            self.blocked_users.pop(str(author.id))
-                            logger.debug("No longer blocked, user %s.", author.name)
+                            self.blocked_roles.pop(str(r.id))
+                            logger.debug("No longer blocked, role %s.", r.name)
                             return True
-                    logger.debug("User blocked, user %s.", author.name)
+                    logger.debug("User blocked, role %s.", r.name)
                     return False
 
         return True
@@ -888,6 +964,15 @@ class ModmailBot(commands.Bot):
                 logger.error("Failed to send message:", exc_info=True)
                 await self.add_reaction(message, blocked_emoji)
             else:
+                for user in thread.recipients:
+                    # send to all other recipients
+                    if user != message.author:
+                        try:
+                            await thread.send(message, user)
+                        except Exception:
+                            # silently ignore
+                            logger.error("Failed to send message:", exc_info=True)
+
                 await self.add_reaction(message, sent_emoji)
                 self.dispatch("thread_reply", thread, False, message, False, False)
 
@@ -939,6 +1024,7 @@ class ModmailBot(commands.Bot):
     async def trigger_auto_triggers(self, message, channel, *, cls=commands.Context):
         message.author = self.modmail_guild.me
         message.channel = channel
+        message.guild = channel.guild
 
         view = StringView(message.content)
         ctx = cls(prefix=self.prefix, view=view, bot=self, message=message)
@@ -967,7 +1053,7 @@ class ModmailBot(commands.Bot):
             ctxs = []
             aliases = normalize_alias(alias)
             if not aliases:
-                logger.warning("Alias %s is invalid as called in automove.", invoker)
+                logger.warning("Alias %s is invalid as called in autotrigger.", invoker)
 
             for alias in aliases:
                 view = StringView(invoked_prefix + alias)
@@ -1147,13 +1233,14 @@ class ModmailBot(commands.Bot):
 
             thread = await self.threads.find(channel=channel)
             if thread is not None and thread.recipient:
-                if await self.is_blocked(thread.recipient):
-                    return
-                await thread.recipient.trigger_typing()
+                for user in thread.recipients:
+                    if await self.is_blocked(user):
+                        continue
+                    await user.trigger_typing()
 
     async def handle_reaction_events(self, payload):
         user = self.get_user(payload.user_id)
-        if user.bot:
+        if user is None or user.bot:
             return
 
         channel = self.get_channel(payload.channel_id)
@@ -1187,6 +1274,14 @@ class ModmailBot(commands.Bot):
                     # the reacted message is the corresponding thread creation embed
                     # closing thread
                     return await thread.close(closer=user)
+            if (
+                message.author == self.user
+                and message.embeds
+                and self.config.get("confirm_thread_creation")
+                and message.embeds[0].title == self.config["confirm_thread_creation_title"]
+                and message.embeds[0].description == self.config["confirm_thread_response"]
+            ):
+                return
             if not thread.recipient.dm_channel:
                 await thread.recipient.create_dm()
             try:
@@ -1201,50 +1296,71 @@ class ModmailBot(commands.Bot):
             if not thread:
                 return
             try:
-                _, linked_message = await thread.find_linked_messages(
+                _, *linked_message = await thread.find_linked_messages(
                     message.id, either_direction=True
                 )
             except ValueError as e:
                 logger.warning("Failed to find linked message for reactions: %s", e)
                 return
 
-        if self.config["transfer_reactions"] and linked_message is not None:
+        if self.config["transfer_reactions"] and linked_message is not [None]:
             if payload.event_type == "REACTION_ADD":
-                if await self.add_reaction(linked_message, reaction):
-                    await self.add_reaction(message, reaction)
+                for msg in linked_message:
+                    await self.add_reaction(msg, reaction)
+                await self.add_reaction(message, reaction)
             else:
                 try:
-                    await linked_message.remove_reaction(reaction, self.user)
+                    for msg in linked_message:
+                        await msg.remove_reaction(reaction, self.user)
                     await message.remove_reaction(reaction, self.user)
                 except (discord.HTTPException, discord.InvalidArgument) as e:
                     logger.warning("Failed to remove reaction: %s", e)
 
-    async def on_raw_reaction_add(self, payload):
-        await self.handle_reaction_events(payload)
-
+    async def handle_react_to_contact(self, payload):
         react_message_id = tryint(self.config.get("react_to_contact_message"))
         react_message_emoji = self.config.get("react_to_contact_emoji")
-        if all((react_message_id, react_message_emoji)):
-            if payload.message_id == react_message_id:
-                if payload.emoji.is_unicode_emoji():
-                    emoji_fmt = payload.emoji.name
-                else:
-                    emoji_fmt = f"<:{payload.emoji.name}:{payload.emoji.id}>"
+        if (
+            not all((react_message_id, react_message_emoji))
+            or payload.message_id != react_message_id
+        ):
+            return
+        if payload.emoji.is_unicode_emoji():
+            emoji_fmt = payload.emoji.name
+        else:
+            emoji_fmt = f"<:{payload.emoji.name}:{payload.emoji.id}>"
 
-                if emoji_fmt == react_message_emoji:
-                    channel = self.get_channel(payload.channel_id)
-                    member = channel.guild.get_member(payload.user_id)
-                    if not member.bot:
-                        message = await channel.fetch_message(payload.message_id)
-                        await message.remove_reaction(payload.emoji, member)
+        if emoji_fmt != react_message_emoji:
+            return
+        channel = self.get_channel(payload.channel_id)
+        member = channel.guild.get_member(payload.user_id)
+        if member.bot:
+            return
+        message = await channel.fetch_message(payload.message_id)
+        await message.remove_reaction(payload.emoji, member)
+        await message.add_reaction(emoji_fmt)  # bot adds as well
 
-                        ctx = await self.get_context(message)
-                        ctx.author = member
-                        await ctx.invoke(
-                            self.get_command("contact"), user=member, manual_trigger=False
-                        )
+        if self.config["dm_disabled"] in (DMDisabled.NEW_THREADS, DMDisabled.ALL_THREADS):
+            embed = discord.Embed(
+                title=self.config["disabled_new_thread_title"],
+                color=self.error_color,
+                description=self.config["disabled_new_thread_response"],
+            )
+            embed.set_footer(
+                text=self.config["disabled_new_thread_footer"], icon_url=self.guild.icon_url,
+            )
+            logger.info(
+                "A new thread using react to contact was blocked from %s due to disabled Modmail.",
+                member,
+            )
+            return await member.send(embed=embed)
 
-                        await message.add_reaction(emoji_fmt)  # bot adds as well
+        ctx = await self.get_context(message)
+        await ctx.invoke(self.get_command("contact"), user=member, manual_trigger=False)
+
+    async def on_raw_reaction_add(self, payload):
+        await asyncio.gather(
+            self.handle_reaction_events(payload), self.handle_react_to_contact(payload),
+        )
 
     async def on_raw_reaction_remove(self, payload):
         if self.config["transfer_reactions"]:
@@ -1519,7 +1635,7 @@ class ModmailBot(commands.Bot):
                     )
                     logger.info("Bot has been updated.")
                     channel = self.log_channel
-                    if self.bot.config["update_notifications"]:
+                    if self.config["update_notifications"]:
                         await channel.send(embed=embed)
             else:
                 try:
@@ -1543,12 +1659,12 @@ class ModmailBot(commands.Bot):
                 elif res != "Already up to date.":
                     logger.info("Bot has been updated.")
                     channel = self.update_channel
-                    if self.hosting_method == HostingMethod.PM2:
+                    if self.hosting_method in (HostingMethod.PM2, HostingMethod.SYSTEMD):
                         embed = discord.Embed(title="Bot has been updated", color=self.main_color)
                         embed.set_footer(
                             text=f"Updating Modmail v{self.version} " f"-> v{latest.version}"
                         )
-                        if self.bot.config["update_notifications"]:
+                        if self.config["update_notifications"]:
                             await channel.send(embed=embed)
                     else:
                         embed = discord.Embed(
@@ -1559,7 +1675,7 @@ class ModmailBot(commands.Bot):
                         embed.set_footer(
                             text=f"Updating Modmail v{self.version} " f"-> v{latest.version}"
                         )
-                        if self.bot.config["update_notifications"]:
+                        if self.config["update_notifications"]:
                             await channel.send(embed=embed)
                     await self.logout()
 
@@ -1569,6 +1685,10 @@ class ModmailBot(commands.Bot):
 
         if self.config.get("disable_autoupdates"):
             logger.warning("Autoupdates disabled.")
+            self.autoupdate_loop.cancel()
+
+        if self.hosting_method == HostingMethod.DOCKER:
+            logger.warning("Autoupdates disabled as using Docker.")
             self.autoupdate_loop.cancel()
 
         if not self.config.get("github_token") and self.hosting_method == HostingMethod.HEROKU:
@@ -1588,9 +1708,9 @@ def main():
         pass
 
     # check discord version
-    if discord.__version__ != "1.5.2":
+    if discord.__version__ != "1.6.0":
         logger.error(
-            "Dependencies are not updated, run pipenv install. discord.py version expected 1.5.2, recieved %s",
+            "Dependencies are not updated, run pipenv install. discord.py version expected 1.6.0, received %s",
             discord.__version__,
         )
         sys.exit(0)

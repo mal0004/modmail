@@ -21,7 +21,9 @@ __all__ = [
     "human_join",
     "days",
     "cleanup_code",
+    "match_title",
     "match_user_id",
+    "match_other_recipients",
     "create_not_found_embed",
     "parse_alias",
     "normalize_alias",
@@ -47,7 +49,7 @@ def strtobool(val):
         raise
 
 
-class User(commands.IDConverter):
+class User(commands.MemberConverter):
     """
     A custom discord.py `Converter` that
     supports `Member`, `User`, and string ID's.
@@ -216,13 +218,16 @@ def cleanup_code(content: str) -> str:
     return content.strip("` \n")
 
 
+TOPIC_OTHER_RECIPIENTS_REGEX = re.compile(
+    r"Other Recipients:\s*((?:\d{17,21},*)+)", flags=re.IGNORECASE
+)
 TOPIC_TITLE_REGEX = re.compile(r"\bTitle: (.*)\n(?:User ID: )\b", flags=re.IGNORECASE | re.DOTALL)
 TOPIC_UID_REGEX = re.compile(r"\bUser ID:\s*(\d{17,21})\b", flags=re.IGNORECASE)
 
 
 def match_title(text: str) -> int:
     """
-    Matches a title in the foramt of "Title: XXXX"
+    Matches a title in the format of "Title: XXXX"
 
     Parameters
     ----------
@@ -257,6 +262,26 @@ def match_user_id(text: str) -> int:
     if match is not None:
         return int(match.group(1))
     return -1
+
+
+def match_other_recipients(text: str) -> int:
+    """
+    Matches a title in the format of "Other Recipients: XXXX,XXXX"
+
+    Parameters
+    ----------
+    text : str
+        The text of the user ID.
+
+    Returns
+    -------
+    Optional[str]
+        The title if found
+    """
+    match = TOPIC_OTHER_RECIPIENTS_REGEX.search(text)
+    if match is not None:
+        return list(map(int, match.group(1).split(",")))
+    return []
 
 
 def create_not_found_embed(word, possibilities, name, n=2, cutoff=0.6) -> discord.Embed:
@@ -339,12 +364,24 @@ def escape_code_block(text):
     return re.sub(r"```", "`\u200b``", text)
 
 
-def format_channel_name(author, guild, exclude_channel=None):
+def format_channel_name(bot, author, exclude_channel=None, force_null=False):
     """Sanitises a username for use with text channel names"""
-    name = author.name.lower()
-    name = new_name = (
-        "".join(l for l in name if l not in string.punctuation and l.isprintable()) or "null"
-    ) + f"-{author.discriminator}"
+    guild = bot.modmail_guild
+
+    if force_null:
+        name = new_name = "null"
+    else:
+        if bot.config["use_user_id_channel_name"]:
+            name = new_name = str(author.id)
+        else:
+            name = author.name.lower()
+            if force_null:
+                name = "null"
+
+            name = new_name = (
+                "".join(l for l in name if l not in string.punctuation and l.isprintable())
+                or "null"
+            ) + f"-{author.discriminator}"
 
     counter = 1
     existed = set(c.name for c in guild.text_channels if c != exclude_channel)

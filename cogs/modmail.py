@@ -1,5 +1,4 @@
 import asyncio
-from operator import truediv
 import re
 from datetime import datetime
 from itertools import zip_longest
@@ -341,7 +340,11 @@ class Modmail(commands.Cog):
 
         if self.bot.config["thread_move_notify_mods"]:
             mention = self.bot.config["mention"]
-            await thread.channel.send(f"{mention}, thread has been moved.")
+            if mention is not None:
+                msg = f"{mention}, thread has been moved."
+            else:
+                msg = "Thread has been moved."
+            await thread.channel.send(msg)
 
         sent_emoji, _ = await self.bot.retrieve_emoji()
         await self.bot.add_reaction(ctx.message, sent_emoji)
@@ -604,6 +607,21 @@ class Modmail(commands.Cog):
     @commands.command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
+    async def msglink(self, ctx, message_id: int):
+        """Retrieves the link to a message in the current thread."""
+        try:
+            message = await ctx.thread.recipient.fetch_message(message_id)
+        except discord.NotFound:
+            embed = discord.Embed(
+                color=self.bot.error_color, description="Message not found or no longer exists."
+            )
+        else:
+            embed = discord.Embed(color=self.bot.main_color, description=message.jump_url)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @checks.thread_only()
     async def loglink(self, ctx):
         """Retrieves the link to the current thread's logs."""
         log_link = await self.bot.api.get_log_link(ctx.channel.id)
@@ -663,6 +681,48 @@ class Modmail(commands.Cog):
         await ctx.message.pin()
         await self.bot.add_reaction(ctx.message, sent_emoji)
 
+    @commands.command(cooldown_after_parsing=True)
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @checks.thread_only()
+    @commands.cooldown(1, 600, BucketType.channel)
+    async def adduser(self, ctx, *, user: discord.Member):
+        """Adds a user to a modmail thread"""
+
+        curr_thread = await self.bot.threads.find(recipient=user)
+        if curr_thread:
+            em = discord.Embed(
+                title="Error",
+                description=f"User is already in a thread: {curr_thread.channel.mention}.",
+                color=self.bot.error_color,
+            )
+            await ctx.send(embed=em)
+        else:
+            em = discord.Embed(
+                title="New Thread (Group)",
+                description=f"{ctx.author.name} has added you to a Modmail thread.",
+                color=self.bot.main_color,
+            )
+            if self.bot.config["show_timestamp"]:
+                em.timestamp = datetime.utcnow()
+            em.set_footer(text=f"{ctx.author}", icon_url=ctx.author.avatar_url)
+            await user.send(embed=em)
+
+            em = discord.Embed(
+                title="New User",
+                description=f"{ctx.author.name} has added {user.name} to the Modmail thread.",
+                color=self.bot.main_color,
+            )
+            if self.bot.config["show_timestamp"]:
+                em.timestamp = datetime.utcnow()
+            em.set_footer(text=f"{user}", icon_url=user.avatar_url)
+
+            for i in ctx.thread.recipients:
+                await i.send(embed=em)
+
+            await ctx.thread.add_user(user)
+            sent_emoji, _ = await self.bot.retrieve_emoji()
+            await self.bot.add_reaction(ctx.message, sent_emoji)
+
     @commands.group(invoke_without_command=True)
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     async def logs(self, ctx, *, user: User = None):
@@ -680,7 +740,7 @@ class Modmail(commands.Cog):
             thread = ctx.thread
             if not thread:
                 raise commands.MissingRequiredArgument(SimpleNamespace(name="member"))
-            user = thread.recipient
+            user = thread.recipient or await self.bot.fetch_user(thread.id)
 
         default_avatar = "https://cdn.discordapp.com/embed/avatars/0.png"
         icon_url = getattr(user, "avatar_url", default_avatar)
@@ -984,7 +1044,7 @@ class Modmail(commands.Cog):
 
         `category`, if specified, may be a category ID, mention, or name.
         `user` may be a user ID, mention, or name.
-        `options` can be `silent`
+        `options` can be `silent` or `silently`.
         """
         silent = False
         if isinstance(category, str):
@@ -996,39 +1056,56 @@ class Modmail(commands.Cog):
             embed = discord.Embed(
                 color=self.bot.error_color, description="Cannot start a thread with a bot."
             )
-            return await ctx.send(embed=embed, delete_afer=3)
+            return await ctx.send(embed=embed, delete_after=3)
 
         exists = await self.bot.threads.find(recipient=user)
         if exists:
-            embed = discord.Embed(
-                color=self.bot.error_color,
-                description="A thread for this user already "
-                f"exists in {exists.channel.mention}.",
-            )
+            desc = "A thread for this user already exists"
+            if exists.channel:
+                desc += f" in {exists.channel.mention}"
+            desc += "."
+            embed = discord.Embed(color=self.bot.error_color, description=desc)
             await ctx.channel.send(embed=embed, delete_after=3)
 
         else:
-            thread = await self.bot.threads.create(user, creator=ctx.author, category=category)
+            creator = ctx.author if manual_trigger else user
+            if await self.bot.is_blocked(user):
+                if not manual_trigger:  # react to contact
+                    return
+
+                ref = f"{user.mention} is" if creator != user else "You are"
+                embed = discord.Embed(
+                    color=self.bot.error_color,
+                    description=f"{ref} currently blocked from contacting {self.bot.user.name}.",
+                )
+                return await ctx.send(embed=embed)
+
+            thread = await self.bot.threads.create(
+                recipient=user, creator=creator, category=category, manual_trigger=manual_trigger,
+            )
+            if thread.cancelled:
+                return
+
             if self.bot.config["dm_disabled"] in (DMDisabled.NEW_THREADS, DMDisabled.ALL_THREADS):
                 logger.info("Contacting user %s when Modmail DM is disabled.", user)
 
             if not silent and not self.bot.config.get("thread_contact_silently"):
-                if ctx.author.id == user.id:
+                if creator.id == user.id:
                     description = "You have opened a Modmail thread."
                 else:
-                    description = f"{ctx.author.name} has opened a Modmail thread."
+                    description = f"{creator.name} has opened a Modmail thread."
 
                 em = discord.Embed(
                     title="New Thread", description=description, color=self.bot.main_color,
                 )
                 if self.bot.config["show_timestamp"]:
                     em.timestamp = datetime.utcnow()
-                em.set_footer(icon_url=ctx.author.avatar_url)
+                em.set_footer(text=f"{creator}", icon_url=creator.avatar_url)
                 await user.send(embed=em)
 
             embed = discord.Embed(
                 title="Created Thread",
-                description=f"Thread started by {ctx.author.mention} for {user.mention}.",
+                description=f"Thread started by {creator.mention} for {user.mention}.",
                 color=self.bot.main_color,
             )
             await thread.wait_until_ready()
@@ -1050,8 +1127,30 @@ class Modmail(commands.Cog):
 
         roles = []
         users = []
+        now = ctx.message.created_at
 
-        for id_, reason in self.bot.blocked_users.items():
+        blocked_users = list(self.bot.blocked_users.items())
+        for id_, reason in blocked_users:
+            # parse "reason" and check if block is expired
+            # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
+            end_time = re.search(r"until ([^`]+?)\.$", reason)
+            if end_time is None:
+                # backwards compat
+                end_time = re.search(r"%([^%]+?)%", reason)
+                if end_time is not None:
+                    logger.warning(
+                        r"Deprecated time message for user %s, block and unblock again to update.",
+                        id_,
+                    )
+
+            if end_time is not None:
+                after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
+                if after <= 0:
+                    # No longer blocked
+                    self.bot.blocked_users.pop(str(id_))
+                    logger.debug("No longer blocked, user %s.", id_)
+                    continue
+
             user = self.bot.get_user(int(id_))
             if user:
                 users.append((user.mention, reason))
@@ -1062,7 +1161,28 @@ class Modmail(commands.Cog):
                 except discord.NotFound:
                     users.append((id_, reason))
 
-        for id_, reason in self.bot.blocked_roles.items():
+        blocked_roles = list(self.bot.blocked_roles.items())
+        for id_, reason in blocked_roles:
+            # parse "reason" and check if block is expired
+            # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
+            end_time = re.search(r"until ([^`]+?)\.$", reason)
+            if end_time is None:
+                # backwards compat
+                end_time = re.search(r"%([^%]+?)%", reason)
+                if end_time is not None:
+                    logger.warning(
+                        r"Deprecated time message for role %s, block and unblock again to update.",
+                        id_,
+                    )
+
+            if end_time is not None:
+                after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
+                if after <= 0:
+                    # No longer blocked
+                    self.bot.blocked_roles.pop(str(id_))
+                    logger.debug("No longer blocked, role %s.", id_)
+                    continue
+
             role = self.bot.guild.get_role(int(id_))
             if role:
                 roles.append((role.mention, reason))
@@ -1175,7 +1295,7 @@ class Modmail(commands.Cog):
         after: UserFriendlyTime = None,
     ):
         """
-        Block a user from using Modmail.
+        Block a user or role from using Modmail.
 
         You may choose to set a time as to when the user will automatically be unblocked.
 
@@ -1190,9 +1310,9 @@ class Modmail(commands.Cog):
             if thread:
                 user_or_role = thread.recipient
             elif after is None:
-                raise commands.MissingRequiredArgument(SimpleNamespace(name="user"))
+                raise commands.MissingRequiredArgument(SimpleNamespace(name="user or role"))
             else:
-                raise commands.BadArgument(f'User "{after.arg}" not found.')
+                raise commands.BadArgument(f'User or role "{after.arg}" not found.')
 
         mention = getattr(user_or_role, "mention", f"`{user_or_role.id}`")
 
@@ -1385,15 +1505,19 @@ class Modmail(commands.Cog):
                 and message.embeds[0].footer.text
             ):
                 user_id = match_user_id(message.embeds[0].footer.text)
+                other_recipients = match_other_recipients(ctx.channel.topic)
+                for n, uid in enumerate(other_recipients):
+                    other_recipients[n] = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+
                 if user_id != -1:
                     recipient = self.bot.get_user(user_id)
                     if recipient is None:
                         self.bot.threads.cache[user_id] = thread = Thread(
-                            self.bot.threads, user_id, ctx.channel
+                            self.bot.threads, user_id, ctx.channel, other_recipients
                         )
                     else:
                         self.bot.threads.cache[user_id] = thread = Thread(
-                            self.bot.threads, recipient, ctx.channel
+                            self.bot.threads, recipient, ctx.channel, other_recipients
                         )
                     thread.ready = True
                     logger.info(
@@ -1420,9 +1544,7 @@ class Modmail(commands.Cog):
             )
             if len(users) == 1:
                 user = users.pop()
-                name = format_channel_name(
-                    user, self.bot.modmail_guild, exclude_channel=ctx.channel
-                )
+                name = format_channel_name(self.bot, user, exclude_channel=ctx.channel)
                 recipient = self.bot.get_user(user.id)
                 if user.id in self.bot.threads.cache:
                     thread = self.bot.threads.cache[user.id]
@@ -1440,13 +1562,18 @@ class Modmail(commands.Cog):
                             await thread.channel.send(embed=embed)
                         except discord.HTTPException:
                             pass
+
+                other_recipients = match_other_recipients(ctx.channel.topic)
+                for n, uid in enumerate(other_recipients):
+                    other_recipients[n] = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+
                 if recipient is None:
                     self.bot.threads.cache[user.id] = thread = Thread(
-                        self.bot.threads, user_id, ctx.channel
+                        self.bot.threads, user_id, ctx.channel, other_recipients
                     )
                 else:
                     self.bot.threads.cache[user.id] = thread = Thread(
-                        self.bot.threads, recipient, ctx.channel
+                        self.bot.threads, recipient, ctx.channel, other_recipients
                     )
                 thread.ready = True
                 logger.info("Setting current channel's topic to User ID and created new thread.")

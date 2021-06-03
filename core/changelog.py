@@ -91,7 +91,7 @@ class Version:
         """
         embed = Embed(color=self.bot.main_color, description=self.description)
         embed.set_author(
-            name=f"v{self.version} - Changelog", icon_url=self.bot.user.avatar_url, url=self.url
+            name=f"v{self.version} - Changelog", icon_url=self.bot.user.avatar_url, url=self.url,
         )
 
         for name, value in self.fields.items():
@@ -179,6 +179,9 @@ class Changelog:
         branch = res.decode("utf-8").rstrip()
         if not branch or err:
             branch = "master" if not bot.version.is_prerelease else "development"
+
+        if branch not in ("master", "development"):
+            branch = "master"
 
         url = url or f"https://raw.githubusercontent.com/kyb3r/modmail/{branch}/CHANGELOG.md"
 
