@@ -537,7 +537,7 @@ class Modmail(commands.Cog):
         if mention in mentions:
             embed = discord.Embed(
                 color=self.bot.error_color,
-                description=f"{mention} is not subscribed to this thread.",
+                description=f"{mention} is already subscribed to this thread.",
             )
         else:
             mentions.append(mention)
@@ -1014,7 +1014,7 @@ class Modmail(commands.Cog):
             embed = discord.Embed(
                 color=self.bot.error_color, description="Cannot start a thread with a bot."
             )
-            return await ctx.send(embed=embed, delete_afer=3)
+            return await ctx.send(embed=embed, delete_after=3)
 
         exists = await self.bot.threads.find(recipient=user)
         if exists:
@@ -1489,9 +1489,7 @@ class Modmail(commands.Cog):
             )
             if len(users) == 1:
                 user = users.pop()
-                name = format_channel_name(
-                    user, self.bot.modmail_guild, exclude_channel=ctx.channel
-                )
+                name = format_channel_name(self.bot, user, exclude_channel=ctx.channel)
                 recipient = self.bot.get_user(user.id)
                 if user.id in self.bot.threads.cache:
                     thread = self.bot.threads.cache[user.id]

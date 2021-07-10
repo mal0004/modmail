@@ -120,7 +120,7 @@ class Thread:
 
         try:
             channel = await self.bot.modmail_guild.create_text_channel(
-                name=format_channel_name(recipient, self.bot.modmail_guild),
+                name=format_channel_name(self.bot, recipient),
                 category=category,
                 overwrites=overwrites,
                 reason="Creating a thread channel.",
@@ -129,7 +129,7 @@ class Thread:
             # try again but null-discrim (name could be banned)
             try:
                 channel = await self.bot.modmail_guild.create_text_channel(
-                    name=format_channel_name(recipient, self.bot.modmail_guild, force_null=True),
+                    name=format_channel_name(self.bot, recipient, force_null=True),
                     category=category,
                     overwrites=overwrites,
                     reason="Creating a thread channel.",
@@ -1205,16 +1205,16 @@ class ThreadManager:
 
         # Schedule thread setup for later
         cat = self.bot.main_category
-        if category is None and len(cat.channels) == 50:
+        if category is None and len(cat.channels) >= 49:
             fallback_id = self.bot.config["fallback_category_id"]
             if fallback_id:
                 fallback = discord.utils.get(cat.guild.categories, id=int(fallback_id))
-                if fallback and len(fallback.channels) != 50:
+                if fallback and len(fallback.channels) < 49:
                     category = fallback
 
             if not category:
                 category = await cat.clone(name="Fallback Modmail")
-                self.bot.config.set("fallback_category_id", category.id)
+                self.bot.config.set("fallback_category_id", str(category.id))
                 await self.bot.config.update()
 
         if (message or not manual_trigger) and self.bot.config["confirm_thread_creation"]:
